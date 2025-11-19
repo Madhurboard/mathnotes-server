@@ -1,14 +1,29 @@
-import google.generativeai as genai
+try:
+    from google import genai
+    from google.genai import types as genai_types
+except Exception:
+    genai = None
+    genai_types = None
+
 import ast
 import json
+import re
 from PIL import Image
 from constants import GEMINI_API_KEY
+from io import BytesIO
 
-genai.configure(api_key=GEMINI_API_KEY)
+client = None
+if GEMINI_API_KEY and genai is not None:
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"[WARN] Failed to initialize google-genai client: {e}")
 
 def analyze_image(img: Image, dict_of_vars: dict):
-    model = genai.GenerativeModel(model_name="gemini-1.5-flash")
-    dict_of_vars_str = json.dumps(dict_of_vars, ensure_ascii=False)
+    if not GEMINI_API_KEY or client is None:
+        return [{"expr": "", "result": "GEMINI_API_KEY is not set on the server.", "assign": False}]
+
+    dict_of_vars_str = json.dumps(dict_of_vars or {}, ensure_ascii=False)
     prompt = (
         f"You have been given an image with some mathematical expressions, equations, or graphical problems, and you need to solve them. "
         f"Note: Use the PEMDAS rule for solving mathematical expressions. PEMDAS stands for the Priority Order: Parentheses, Exponents, Multiplication and Division (from left to right), Addition and Subtraction (from left to right). Parentheses have the highest priority, followed by Exponents, then Multiplication and Division, and lastly Addition and Subtraction. "
@@ -30,17 +45,84 @@ def analyze_image(img: Image, dict_of_vars: dict):
         f"DO NOT USE BACKTICKS OR MARKDOWN FORMATTING. "
         f"PROPERLY QUOTE THE KEYS AND VALUES IN THE DICTIONARY FOR EASIER PARSING WITH Python's ast.literal_eval."
     )
-    response = model.generate_content([prompt, img])
-    print(response.text)
+    
+    try:
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        img_bytes = buf.getvalue()
+    except Exception as e:
+        return [{"expr": "", "result": f"Image serialization error: {e}", "assign": False}]
+
+    try:
+        image_part = genai_types.Part(
+            inline_data=genai_types.Blob(mime_type="image/png", data=img_bytes)
+        )
+
+        response = None
+        try:
+            response = client.models.generate_content(
+                model="gemini-2.0-flash", input=[prompt, image_part]
+            )
+        except TypeError:
+            response = client.models.generate_content(
+                model="gemini-2.0-flash", contents=[prompt, image_part]
+            )
+        except AttributeError:
+            try:
+                response = client.responses.generate(
+                    model="gemini-2.0-flash", input=[prompt, image_part]
+                )
+            except TypeError:
+                response = client.responses.generate(
+                    model="gemini-2.0-flash", contents=[prompt, image_part]
+                )
+
+        text = (
+            getattr(response, "output_text", None)
+            or getattr(response, "text", None)
+            or ""
+        )
+        
+        if not text:
+            try:
+                candidates = getattr(response, "candidates", None) or []
+                for c in candidates:
+                    content = getattr(c, "content", None)
+                    if not content:
+                        continue
+                    parts = getattr(content, "parts", None) or []
+                    for p in parts:
+                        t = getattr(p, "text", None)
+                        if t:
+                            text = t
+                            break
+                    if text:
+                        break
+            except Exception:
+                pass
+        
+        if not text or text.strip() == "":
+            return [{"expr": "", "result": "Gemini returned empty response. Please check API key and quota.", "assign": False}]
+        
+        match = re.search(r'```(?:\w+)?\s*(.*?)```', text, re.DOTALL)
+        if match:
+            text = match.group(1).strip()
+        else:
+            text = text.strip()
+
+    except Exception as e:
+        return [{"expr": "", "result": f"Gemini API error: {e}", "assign": False}]
+    
     answers = []
     try:
-        answers = ast.literal_eval(response.text)
+        answers = ast.literal_eval(text)
     except Exception as e:
-        print(f"Error in parsing response from Gemini API: {e}")
-    print('returned answer ', answers)
+        return [{"expr": "", "result": f"Parse Error: {e}. Raw text: {text}", "assign": False}]
+
     for answer in answers:
         if 'assign' in answer:
             answer['assign'] = True
         else:
             answer['assign'] = False
+    
     return answers
